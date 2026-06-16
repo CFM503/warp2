@@ -25,7 +25,7 @@ import (
 // ════════════════════════════════════════════════════════════════════════════════
 
 const (
-	appVersion = "1.5.0"
+	appVersion = "2.0.1"
 
 	// Cloudflare WARP API
 	warpRegisterURL    = "https://warp.cloudflare.nyc.mn/?run=register"
