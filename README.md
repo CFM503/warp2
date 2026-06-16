@@ -132,8 +132,62 @@ Proxy 模式下 `gateway=off` 是**正常状态**。Gateway 需要接管设备 D
 
 | 模式 | warp= | gateway= | 用途 |
 |------|-------|----------|------|
-| Proxy 模式 | plus | off | 改 IP + SOCKS5 代理 |
-| 全隧道模式 | plus | on | 全流量过滤 + 改 IP |
+| 菜单 2 Proxy 模式 | plus | off（固定） | 改 IP + SOCKS5 代理 |
+| 菜单 3 WireGuard 模式 | plus | 取决于 Dashboard 配置 | 全流量接入 Zero Trust |
+
+## Gateway 过滤层说明
+
+Gateway 是 Zero Trust 的安全策略引擎，在流量到达目标网站之前进行检查和过滤。
+
+### 过滤层级
+
+```
+DNS 请求  →  [Gateway DNS 策略]  →  放行 / 拦截
+HTTP 请求 →  [Gateway HTTP 策略] →  放行 / 拦截 / 改写
+TCP/UDP   →  [Gateway 网络策略]  →  放行 / 拦截
+```
+
+### 能做什么
+
+| 功能 | 说明 |
+|------|------|
+| 屏蔽恶意网站 | 自动拦截钓鱼、恶意软件域名 |
+| 屏蔽广告 | 按域名/分类拦截广告追踪器 |
+| 内容过滤 | 屏蔽特定类别（赌博、成人、社交等） |
+| 域名黑白名单 | 只允许访问特定网站，或屏蔽特定网站 |
+| DLP 数据防泄漏 | 阻止敏感数据（信用卡号、身份证号）外传 |
+| 文件扫描 | 检测上传/下载文件中的恶意内容 |
+| 日志审计 | 记录所有 DNS/HTTP 请求，事后追溯 |
+
+### 菜单 2 vs 菜单 3 的 Gateway 行为
+
+```
+菜单 2（Proxy 模式）：
+  VPS → WARP 隧道（加密）→ 互联网
+       ↓
+    没有 Gateway 检查，纯粹改 IP + 加密
+    gateway=off 是固定状态，无法开启
+
+菜单 3（WireGuard 全隧道）：
+  VPS → WARP 隧道 → Gateway 策略引擎 → 互联网
+                          ↓
+                   检查每个请求：恶意域名？敏感数据？违规内容？
+    gateway=on/off 取决于 Zero Trust Dashboard 是否配置了策略
+```
+
+### VPS 场景下要不要开 Gateway
+
+| 场景 | 建议 |
+|------|------|
+| 只想改 IP | 不需要，用菜单 2（gateway=off） |
+| VPS 跑爬虫/代理 | 不需要，反而可能误拦截 |
+| VPS 跑企业应用 | 可以用菜单 3 开 Gateway，防数据泄露 + 审计 |
+| VPS 做反代给团队用 | 值得开，可以过滤恶意请求保护用户 |
+| VPS 做 API 网关 | 可以开，限流 + 防滥用 |
+
+### 结论
+
+Gateway 的核心价值是**在 WARP 隧道加密之上再加一层策略过滤**。对大多数改 IP 的用法，`gateway=off` 完全够用，开了反而可能影响代理的兼容性。需要安全过滤能力时，使用菜单 3 并在 Dashboard 配置 Gateway 策略。
 
 ## 命令行参数
 
