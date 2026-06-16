@@ -1,0 +1,13 @@
+# Compiled binaries
+warpgo
+warpgo-*
+*.exe
+
+# Go build artifacts
+*.o
+*.a
+*.so
+
+# OS files
+.DS_Store
+Thumbs.db
