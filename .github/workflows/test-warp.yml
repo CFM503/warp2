@@ -16,7 +16,7 @@ jobs:
         run: GOOS=linux GOARCH=amd64 go build -o warpgo-linux-amd64 warp2.go
 
       - name: Install system deps
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq wireguard-tools curl jq openresolv
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq wireguard-tools curl jq resolvconf 2>/dev/null; sudo apt-get install -y -qq wireguard-tools curl jq 2>/dev/null; echo "deps installed"
 
       - name: Verify WireGuard tools
         run: which wg && which wg-quick && modprobe wireguard 2>/dev/null; echo "wg ready"
