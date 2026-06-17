@@ -1,4 +1,4 @@
-# WarpGo v2.0.1
+# WarpGo v2.0.2
 
 一键部署 Cloudflare WARP / Zero Trust Proxy，让 VPS 通过 WARP 隧道改变出口 IP。
 
@@ -13,7 +13,7 @@
 
 ```bash
 # 下载
-wget https://github.com/CFM503/warp2/releases/download/v2.0.1/warpgo-linux-amd64
+wget https://github.com/CFM503/warp2/releases/download/v2.0.2/warpgo-linux-amd64
 chmod +x warpgo-linux-amd64
 
 # 运行交互菜单
@@ -246,7 +246,7 @@ Access → Service Auth → Service Tokens
 
 ```
 ╔══════════════════════════════════════════╗
-║  WarpGo v2.0.1                           ║
+║  WarpGo v2.0.2                           ║
 ╚══════════════════════════════════════════╝
 
   系统: debian 13 (linux/amd64)
