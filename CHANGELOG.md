@@ -63,6 +63,30 @@ if err := account.saveToFile(warpAccountPath); err != nil {
 
 ---
 
+#### 3. 卸载清理不完整 - 残留 ip rule 和临时文件
+
+**问题描述**：
+- 卸载后残留 SSH 保护规则（priority 0）
+- `/run/warp-ssh` 临时目录未清理
+- `warpgo-autoconnect.service` 服务文件未清理
+
+**修复方案**：
+```go
+// cleanupNetworkRules() 中更新规则清理逻辑
+// 旧代码：查找 priority 10 规则（已不存在）
+// 新代码：查找 priority 0 规则（SSH 保护）
+
+// 新增清理
+exec.Command("ip", "rule", "del", "table", "main", "suppress_prefixlength", "0").Run()
+os.RemoveAll("/run/warp-ssh")
+```
+
+**修改函数**：
+- `cleanupNetworkRules()` - 更新规则清理逻辑，添加临时目录清理
+- `cleanupConfigFiles()` - 添加 `warpgo-autoconnect.service` 清理
+
+---
+
 ### 📝 修改文件清单
 
 | 文件 | 函数 | 修改类型 |
