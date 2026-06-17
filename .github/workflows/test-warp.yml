@@ -1,0 +1,48 @@
+name: Test WARP Installation
+on:
+  workflow_dispatch:
+
+jobs:
+  test-warp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Build
+        run: GOOS=linux GOARCH=amd64 go build -o warpgo-linux-amd64 warp2.go
+
+      - name: Install system deps
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq wireguard-tools curl jq openresolv
+
+      - name: Verify WireGuard tools
+        run: which wg && which wg-quick && modprobe wireguard 2>/dev/null; echo "wg ready"
+
+      - name: Run diagnostics first
+        run: sudo ./warpgo-linux-amd64 -diag 2>&1 || true
+
+      - name: Run menu 1 installation
+        run: sudo ./warpgo-linux-amd64 -4 2>&1
+        timeout-minutes: 5
+
+      - name: Check WARP status
+        if: always()
+        run: |
+          echo "=== WireGuard interface ==="
+          sudo wg show warp 2>&1 || echo "no warp interface"
+          echo ""
+          echo "=== Cloudflare trace ==="
+          curl -s --max-time 10 https://www.cloudflare.com/cdn-cgi/trace 2>&1 || echo "trace failed"
+          echo ""
+          echo "=== IP check ==="
+          curl -s --max-time 10 -4 https://api4.ipify.org 2>&1 || echo "ip check failed"
+          echo ""
+          echo "=== DNS ==="
+          cat /etc/resolv.conf 2>&1 || true
+
+      - name: Cleanup
+        if: always()
+        run: sudo wg-quick down warp 2>/dev/null; sudo ip link del warp 2>/dev/null; true
