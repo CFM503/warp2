@@ -457,8 +457,83 @@ func registerWARP(team *teamRegistration) (*Account, error) {
 	return registerWARPPlain()
 }
 
-// registerWARPPlain 注册普通 WARP（第三方代理，warp=on gateway=off）
+// registerWARPPlain 注册普通 WARP。优先使用官方 API（本地生成密钥对），失败则回退第三方代理。
 func registerWARPPlain() (*Account, error) {
+	// 方式 1：官方 API（本地生成 Curve25519 密钥对，POST /reg）
+	account, err := registerWARPPlainOfficial()
+	if err == nil {
+		return account, nil
+	}
+	uiHint(fmt.Sprintf("  官方 API 注册失败: %v，尝试第三方代理...", err))
+
+	// 方式 2：第三方代理
+	return registerWARPPlainProxy()
+}
+
+// registerWARPPlainOfficial 直接调用 Cloudflare 官方 API 注册普通 WARP。
+// 本地生成密钥对 → POST /reg → 解析 peer/地址信息。无需第三方代理。
+func registerWARPPlainOfficial() (*Account, error) {
+	privKey, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("生成密钥对失败: %v", err)
+	}
+	pubKeyB64 := base64.StdEncoding.EncodeToString(privKey.PublicKey().Bytes())
+	privKeyB64 := base64.StdEncoding.EncodeToString(privKey.Bytes())
+
+	installID := newUUID()
+	body := map[string]interface{}{
+		"key":           pubKeyB64,
+		"install_id":    installID,
+		"fcm_token":     newUUID(),
+		"tos":           time.Now().UTC().Format(time.RFC3339),
+		"model":         "Linux",
+		"serial_number": installID,
+		"locale":        "zh-CN",
+	}
+	bodyJSON, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("序列化请求失败: %v", err)
+	}
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	req, err := http.NewRequest("POST", warpCFAPIBase+"/reg", bytes.NewReader(bodyJSON))
+	if err != nil {
+		return nil, fmt.Errorf("构造请求失败: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "1.1.1.1/6.29 CFNetwork/1408.0.4 Darwin/22.5.0")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("请求失败: %v", err)
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("读取响应失败: %v", err)
+	}
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody[:min(200, len(respBody))]))
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return nil, fmt.Errorf("解析响应失败: %v", err)
+	}
+
+	account := parseWARPAccount(result, false, "")
+	// 官方 API 不在响应中返回 private_key，使用本地生成的
+	account.PrivateKey = privKeyB64
+	account.PublicKey = pubKeyB64
+
+	if err := validateAccount(account); err != nil {
+		return nil, fmt.Errorf("注册数据无效: %v", err)
+	}
+	return account, nil
+}
+
+// registerWARPPlainProxy 通过第三方代理注册（回退方案）。
+func registerWARPPlainProxy() (*Account, error) {
 	client := &http.Client{Timeout: 30 * time.Second}
 	req, err := http.NewRequest("GET", warpRegisterURL, nil)
 	if err != nil {
