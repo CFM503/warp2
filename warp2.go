@@ -1769,7 +1769,17 @@ func verifyProxyConnection(externalPort int) {
 func installDependencies(sysInfo *SysInfo) error {
 	packages := []string{"curl", "jq"}
 	if sysInfo.PkgManager == "apt" {
-		packages = append(packages, "openresolv")
+		// resolvconf 提供 DNS 管理（wg-quick 用它设置 DNS），
+		// 但 Ubuntu 24.04+ 已移除 openresolv，改用 systemd-resolved。
+		// 如果 resolvconf 命令已存在则跳过安装。
+		if _, err := exec.LookPath("resolvconf"); err != nil {
+			if err := installPackages("apt", []string{"openresolv"}); err != nil {
+				// openresolv 不可用时尝试 resolvconf 包
+				if err := installPackages("apt", []string{"resolvconf"}); err != nil {
+					uiHint("  resolvconf/openresolv 均不可用，DNS 由 systemd-resolved 管理")
+				}
+			}
+		}
 	}
 	return installPackages(sysInfo.PkgManager, packages)
 }
