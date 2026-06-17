@@ -480,7 +480,11 @@ func registerWARPPlain() (*Account, error) {
 	if err := json.Unmarshal(body, &result); err != nil {
 		return nil, fmt.Errorf("解析响应失败: %v", err)
 	}
-	return parseWARPAccount(result, false, ""), nil
+	account := parseWARPAccount(result, false, "")
+	if err := validateAccount(account); err != nil {
+		return nil, fmt.Errorf("注册数据无效: %v\n原始响应: %s", err, string(body))
+	}
+	return account, nil
 }
 
 // registerWARPZeroTrust 直接调用 Cloudflare 官方 API 注册并关联 Zero Trust 组织。
@@ -563,6 +567,10 @@ func registerWARPZeroTrust(team *teamRegistration) (*Account, error) {
 	account.PrivateKey = privKeyB64
 	account.PublicKey = pubKeyB64
 
+	if err := validateAccount(account); err != nil {
+		return nil, fmt.Errorf("ZT 注册数据无效: %v", err)
+	}
+
 	if err := account.saveToFile(warpAccountPath); err != nil {
 		return nil, fmt.Errorf("保存账号信息失败: %v", err)
 	}
@@ -600,6 +608,17 @@ func parseWARPAccount(result map[string]interface{}, isTeams bool, orgName strin
 		_ = account.saveToFile(warpAccountPath)
 	}
 	return account
+}
+
+// validateAccount 检查注册返回的账号数据是否完整，缺少关键字段时返回错误。
+func validateAccount(account *Account) error {
+	if account.PrivateKey == "" {
+		return fmt.Errorf("注册返回的 PrivateKey 为空，第三方注册服务可能不可用")
+	}
+	if account.IPv4 == "" && account.IPv6 == "" {
+		return fmt.Errorf("注册返回的 IP 地址为空（v4=%q v6=%q），第三方注册服务可能不可用", account.IPv4, account.IPv6)
+	}
+	return nil
 }
 
 // newUUID 生成随机 UUID v4 字符串（不依赖外部包）
@@ -791,34 +810,43 @@ func globalPreUpScript(stack stackMode) string {
 	cmds = append(cmds, "mkdir -p /run/warp-ssh")
 	if stack == stackIPv4 || stack == stackDual {
 		cmds = append(cmds,
-			`ip -4 route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+' | head -1 > /run/warp-ssh/orig_ip4 || true`,
+			`ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}' > /run/warp-ssh/orig_ip4 || true`,
 		)
 	}
 	if stack == stackIPv6 || stack == stackDual {
 		cmds = append(cmds,
-			`ip -6 route get 2606:4700::1 2>/dev/null | grep -oP 'src \K\S+' | head -1 > /run/warp-ssh/orig_ip6 || true`,
+			`ip -6 route get 2606:4700::1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}' > /run/warp-ssh/orig_ip6 || true`,
 		)
 	}
-	return strings.Join(cmds, " && ")
+	return strings.Join(cmds, "; ")
 }
 
-// globalPostUpScript 在 wg-quick 路由设置完成后执行，读取 PreUp 保存的原始 IP，
-// 添加高优先级（10）ip rule，让原始 IP 的出站流量走 main 表（含原始网关），
-// 优先级高于 wg-quick 的 32765，确保 SSH 回包走原始路由。
+// globalPostUpScript 在 wg-quick 路由设置完成后执行：
+// 1) 读取 PreUp 保存的原始 IP，添加高优先级（10）ip rule，让原始 IP 的出站流量走 main 表。
+// 2) 在 wg-quick 创建的 nft 表中插入 SSH 豁免规则，防止 nft 给 SSH 回包打 fwmark。
+//    wg-quick 的 nft 会给所有本机发出的包打 fwmark 0xca6c，导致包匹配 suppress_prefixlength 0
+//    规则时默认路由被抑制、无可用路由而丢包。豁免规则让已建立的 SSH 连接不被标记。
 func globalPostUpScript() string {
+	sshNft := `nft list table ip wg-quick-warp >/dev/null 2>&1 && { ` +
+		`SP=$(grep -i "^Port " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2; exit}'); ` +
+		`SP=${SP:-22}; ` +
+		`nft insert rule ip wg-quick-warp output ct state established,related tcp sport "$SP" accept 2>/dev/null || true; } || true`
+	// 注意：用 ; 分隔且每条命令都以 || true 结尾，因为 wg-quick 以 set -e 运行 PostUp，
+	// 任何命令返回非零（如 [ -s file ] 文件不存在、IPv6 不可用）都会导致接口被 tear down。
 	return strings.Join([]string{
-		`[ -s /run/warp-ssh/orig_ip4 ] && ip -4 rule add from "$(cat /run/warp-ssh/orig_ip4)" table main priority 10 2>/dev/null || true`,
-		`[ -s /run/warp-ssh/orig_ip6 ] && ip -6 rule add from "$(cat /run/warp-ssh/orig_ip6)" table main priority 10 2>/dev/null || true`,
-	}, " && ")
+		`([ -s /run/warp-ssh/orig_ip4 ] && ip -4 rule add from "$(cat /run/warp-ssh/orig_ip4)" table main priority 10 || true) 2>/dev/null`,
+		`([ -s /run/warp-ssh/orig_ip6 ] && ip -6 rule add from "$(cat /run/warp-ssh/orig_ip6)" table main priority 10 || true) 2>/dev/null`,
+		sshNft,
+	}, "; ")
 }
 
 // globalPostDownScript 撤销 PostUp 添加的规则，清理临时文件。
 func globalPostDownScript() string {
 	return strings.Join([]string{
-		`[ -s /run/warp-ssh/orig_ip4 ] && ip -4 rule del from "$(cat /run/warp-ssh/orig_ip4)" table main priority 10 2>/dev/null || true`,
-		`[ -s /run/warp-ssh/orig_ip6 ] && ip -6 rule del from "$(cat /run/warp-ssh/orig_ip6)" table main priority 10 2>/dev/null || true`,
+		`([ -s /run/warp-ssh/orig_ip4 ] && ip -4 rule del from "$(cat /run/warp-ssh/orig_ip4)" table main priority 10 || true) 2>/dev/null`,
+		`([ -s /run/warp-ssh/orig_ip6 ] && ip -6 rule del from "$(cat /run/warp-ssh/orig_ip6)" table main priority 10 || true) 2>/dev/null`,
 		`rm -f /run/warp-ssh/orig_ip4 /run/warp-ssh/orig_ip6`,
-	}, " && ")
+	}, "; ")
 }
 
 func getWgConfigStatus() *WgConfigStatus {
@@ -1191,7 +1219,7 @@ func cleanupTransparentProxy() {
 }
 
 func installProxyService(socks5Port int) {
-	serviceContent := fmt.Sprintf("[Unit]\nDescription=WarpGo Transparent Proxy\nAfter=warp-svc.service\nWants=warp-svc.service\n\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/bash -c 'warp-cli --accept-tos connect; for i in $(seq 1 60); do warp-cli --accept-tos status 2>/dev/null | grep -q Connected && break; sleep 1; done; systemctl start redsocks; %s'\nExecStop=/bin/bash -c 'systemctl stop redsocks; iptables -t nat -F WARP_PROXY 2>/dev/null; iptables -t nat -D OUTPUT -j WARP_PROXY 2>/dev/null; iptables -t nat -X WARP_PROXY 2>/dev/null'\n\n[Install]\nWantedBy=multi-user.target\n", generateIptablesCommands(defaultRedsocksPort))
+	serviceContent := fmt.Sprintf("[Unit]\nDescription=WarpGo Transparent Proxy\nAfter=warp-svc.service\nWants=warp-svc.service\n\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/bash -c 'warp-cli --accept-tos connect; for i in $(seq 1 60); do warp-cli --accept-tos status 2>/dev/null | grep -q Connected && break; sleep 1; done; systemctl start redsocks; %s'\nExecStop=/bin/bash -c 'systemctl stop redsocks; iptables -t nat -F WARP_PROXY 2>/dev/null; iptables -t nat -D OUTPUT -j WARP_PROXY 2>/dev/null; iptables -t nat -X WARP_PROXY 2>/dev/null; nft delete table ip warp_proxy 2>/dev/null; nft delete table ip6 warp_proxy 2>/dev/null'\n\n[Install]\nWantedBy=multi-user.target\n", generateIptablesCommands(defaultRedsocksPort))
 	os.WriteFile("/etc/systemd/system/warpgo-proxy.service", []byte(serviceContent), 0644)
 	exec.Command("systemctl", "daemon-reload").Run()
 	exec.Command("systemctl", "enable", "warpgo-proxy").Run()
@@ -1254,9 +1282,12 @@ WantedBy=multi-user.target
 	uiInfo(fmt.Sprintf("✓ 反代已启动: socks5://0.0.0.0:%d → 127.0.0.1:%d", externalPort, defaultSocks5Port))
 }
 
-// cleanupExternalProxy 停止 socat 反代服务
+// cleanupExternalProxy 停止 socat 反代服务，清理 iptables 和 nft 规则
 func cleanupExternalProxy() {
 	exec.Command("systemctl", "stop", "warpgo-reverse-proxy").Run()
+	exec.Command("iptables", "-t", "nat", "-F", "WARP_PROXY").Run()
+	exec.Command("iptables", "-t", "nat", "-D", "OUTPUT", "-j", "WARP_PROXY").Run()
+	exec.Command("iptables", "-t", "nat", "-X", "WARP_PROXY").Run()
 	exec.Command("nft", "delete", "table", "ip", "warp_proxy").Run()
 	exec.Command("nft", "delete", "table", "ip6", "warp_proxy").Run()
 }
@@ -1378,8 +1409,13 @@ func installWireGuardMode(sysInfo *SysInfo, opts *InstallOptions) error {
 	if err := wgStart(); err != nil {
 		return fmt.Errorf("启动失败: %v", err)
 	}
+	// 开机自启：启用 wg-quick@warp 服务，重启后自动恢复隧道
+	exec.Command("systemctl", "daemon-reload").Run()
+	exec.Command("systemctl", "enable", "wg-quick@warp").Run()
 	uiStep(6, 6, "验证连接")
-	verifyConnection()
+	if !verifyConnectionWithFallback(opts.Endpoint) {
+		return fmt.Errorf("WARP 连接失败，请运行 ./warpgo -diag 查看详情")
+	}
 	return nil
 }
 
@@ -1444,7 +1480,7 @@ ExecStart=/bin/bash -c '\
     warp-cli --accept-tos status 2>/dev/null | grep -qE "Connected|Disconnected" && break; \
     sleep 1; \
   done; \
-  VPS_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oP "src \K\S+" | head -1); \
+  VPS_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}'); \
   [ -n "$VPS_IP" ] && warp-cli --accept-tos tunnel ip add "$VPS_IP/32" 2>/dev/null || true; \
   warp-cli --accept-tos tunnel ip add 10.0.0.0/8 2>/dev/null || true; \
   warp-cli --accept-tos tunnel ip add 172.16.0.0/12 2>/dev/null || true; \
@@ -1548,24 +1584,113 @@ func installZeroTrustWGMode(sysInfo *SysInfo, opts *InstallOptions) error {
 	if err := wgStart(); err != nil {
 		return fmt.Errorf("启动失败: %v", err)
 	}
+	// 开机自启
+	exec.Command("systemctl", "daemon-reload").Run()
+	exec.Command("systemctl", "enable", "wg-quick@warp").Run()
 	uiStep(6, 7, "验证连接")
-	verifyConnection()
+	if !verifyConnectionWithFallback(opts.Endpoint) {
+		return fmt.Errorf("WARP 连接失败，请运行 ./warpgo -diag 查看详情")
+	}
 	uiStep(7, 7, "完成")
 	uiInfo("✓ Zero Trust (WireGuard) 配置完成")
 	return nil
 }
 
+// verifyConnectionWithFallback 验证 WARP 连接，如果握手失败则自动尝试其他 Endpoint 端口。
+// 部分 VPS 机房会封 UDP 2408，但 500/1701/4500/8443 仍可用。
+func verifyConnectionWithFallback(userEndpoint string) bool {
+	// 第一次验证：用当前 Endpoint
+	if checkWarpConnection() {
+		return true
+	}
+
+	// 握手未完成，尝试自动切换 Endpoint
+	uiWarning("默认 Endpoint 握手超时，尝试自动切换端口...")
+
+	// 从当前配置提取 IP，尝试不同端口
+	currentEP := getCurrentEndpoint()
+	host, _, _ := net.SplitHostPort(currentEP)
+	if host == "" {
+		host = "162.159.192.1"
+	}
+
+	// 如果用户指定了 Endpoint，只试那个，不自动切换
+	if userEndpoint != "" {
+		uiHint("  用户指定了 Endpoint，不自动切换")
+		printDiagnostics()
+		return false
+	}
+
+	fallbackPorts := []string{"500", "1701", "4500", "8443"}
+	// 如果默认 IP 的所有端口都失败，换一个 IP 段
+	fallbackIPs := []string{"162.159.192.1", "162.159.204.1"}
+
+	tried := map[string]bool{currentEP: true}
+
+	for _, ip := range fallbackIPs {
+		for _, port := range fallbackPorts {
+			ep := net.JoinHostPort(ip, port)
+			if tried[ep] {
+				continue
+			}
+			tried[ep] = true
+
+			uiInfo(fmt.Sprintf("  尝试 %s ...", ep))
+			wgStop()
+			time.Sleep(500 * time.Millisecond)
+			if err := switchEndpoint(ep); err != nil {
+				uiHint(fmt.Sprintf("    配置更新失败: %v", err))
+				continue
+			}
+			if err := wgStart(); err != nil {
+				uiHint(fmt.Sprintf("    启动失败: %v", err))
+				continue
+			}
+
+			if checkWarpConnection() {
+				uiInfo(fmt.Sprintf("✓ 切换到 %s 成功，WARP 已连接", ep))
+				return true
+			}
+			uiHint("    握手未完成")
+		}
+	}
+
+	// 所有 Endpoint 都失败
+	uiWarning("所有 Endpoint 均无法建立连接")
+	printDiagnostics()
+	return false
+}
+
+// checkWarpConnection 等待握手并检查 WARP 状态，返回是否成功。
+func checkWarpConnection() bool {
+	for i := 0; i < 3; i++ {
+		time.Sleep(5 * time.Second)
+		if checkWarpEnabled() {
+			return true
+		}
+	}
+	return false
+}
+
+// printDiagnostics 打印诊断提示信息。
+func printDiagnostics() {
+	uiHint("  诊断建议:")
+	uiHint("    1. 运行 ./warpgo -diag 查看详细诊断")
+	uiHint("    2. VPS 可能封了所有 UDP 出站（常见于国内机房）")
+	uiHint("    3. 尝试菜单 e 手动指定优选 IP:端口")
+}
+
 func verifyConnection() {
 	uiInfo("等待 WARP 握手建立...")
 	var status *NetworkStatus
-	for i := 0; i < 3; i++ {
+	for i := 0; i < 4; i++ {
 		time.Sleep(5 * time.Second)
 		status = getNetworkStatus()
 		if status.WarpEnabled {
 			break
 		}
-		if i < 2 {
-			uiInfo(fmt.Sprintf("  等待中... (%d/3)", i+1))
+		if i < 3 {
+			uiInfo(fmt.Sprintf("  等待中... (%d/4)", i+1))
 		}
 	}
 	if status.WarpEnabled {
@@ -1580,9 +1705,25 @@ func verifyConnection() {
 			uiHint("  提示: gateway=off，当前为普通 WARP 模式（非 Zero Trust）")
 		}
 	} else {
-		uiWarning("WARP 连接验证超时，请稍后用 'wg show warp' 确认握手状态")
+		uiWarning("WARP 连接验证超时")
+		// 诊断握手状态
+		if out, err := exec.Command("wg", "show", warpIfName, "latest-handshakes").Output(); err == nil {
+			hs := strings.TrimSpace(string(out))
+			if hs == "" || strings.HasSuffix(hs, "0") {
+				uiWarning("  原因: WireGuard 握手未完成（Endpoint 无法到达或密钥无效）")
+				uiHint("  可能原因:")
+				uiHint("    1. VPS 出口 UDP 被封（部分机房封 UDP 2408）")
+				uiHint("    2. 第三方注册服务返回了无效的密钥/IP")
+				uiHint("    3. Endpoint IP 不可达")
+				uiHint("  建议: 菜单选 e 切换优选 IP，或检查 UDP 连通性")
+			} else {
+				uiHint("  WireGuard 握手已完成，但 Cloudflare trace 验证失败")
+				uiHint("  可能是 DNS 解析问题，请检查 /etc/resolv.conf")
+			}
+		}
 		uiHint(fmt.Sprintf("  当前 IPv4: %s", status.IPv4))
-		uiHint("  验证命令: curl https://www.cloudflare.com/cdn-cgi/trace | grep -E 'warp|gateway'")
+		uiHint("  手动验证: curl https://www.cloudflare.com/cdn-cgi/trace | grep -E 'warp|gateway'")
+		uiHint("  查看握手: wg show warp")
 	}
 }
 
@@ -1851,6 +1992,176 @@ func restoreDNS() {
 	uiInfo("  已创建默认 DNS 配置")
 }
 
+// runDiagnostics 诊断 WARP 连接问题，在 VPS 上运行 ./warpgo -diag 即可。
+func runDiagnostics() {
+	uiHeader("WARP 连接诊断")
+	uiSeparator()
+
+	// 1. 检查 WireGuard 工具
+	uiStep(1, 7, "检查 WireGuard 工具")
+	if _, err := exec.LookPath("wg"); err != nil {
+		uiWarning("  wg 命令未找到")
+	} else {
+		uiInfo("  ✓ wg 已安装")
+	}
+	if _, err := exec.LookPath("wg-quick"); err != nil {
+		uiWarning("  wg-quick 命令未找到")
+	} else {
+		uiInfo("  ✓ wg-quick 已安装")
+	}
+
+	// 2. 检查内核模块
+	uiStep(2, 7, "检查 WireGuard 内核模块")
+	if out, err := exec.Command("modprobe", "wireguard").CombinedOutput(); err != nil {
+		uiWarning(fmt.Sprintf("  modprobe wireguard 失败: %s", strings.TrimSpace(string(out))))
+		uiHint("  需要 Linux 5.6+ 内核或安装 wireguard-go")
+	} else {
+		uiInfo("  ✓ WireGuard 内核模块可用")
+	}
+
+	// 3. 检查配置文件
+	uiStep(3, 7, "检查 WireGuard 配置")
+	if _, err := os.Stat(warpConfPath); err != nil {
+		uiWarning("  /etc/wireguard/warp.conf 不存在")
+	} else {
+		data, _ := os.ReadFile(warpConfPath)
+		conf := string(data)
+		uiInfo("  ✓ 配置文件存在")
+
+		// 检查关键字段
+		if !strings.Contains(conf, "PrivateKey") {
+			uiWarning("  ❌ PrivateKey 缺失")
+		}
+		if !strings.Contains(conf, "Endpoint") {
+			uiWarning("  ❌ Endpoint 缺失")
+		}
+		if !strings.Contains(conf, "PublicKey") {
+			uiWarning("  ❌ Peer PublicKey 缺失")
+		}
+		// 提取 endpoint
+		for _, line := range strings.Split(conf, "\n") {
+			if strings.HasPrefix(strings.TrimSpace(line), "Endpoint") {
+				uiInfo(fmt.Sprintf("  Endpoint: %s", strings.TrimSpace(strings.SplitN(line, "=", 2)[1])))
+			}
+		}
+	}
+
+	// 4. 检查账号数据
+	uiStep(4, 7, "检查注册数据")
+	if acc, err := loadAccountFromFile(warpAccountPath); err != nil {
+		uiWarning(fmt.Sprintf("  账号文件读取失败: %v", err))
+	} else {
+		uiInfo(fmt.Sprintf("  ID: %s", acc.ID[:min(8, len(acc.ID))]))
+		if acc.PrivateKey == "" {
+			uiWarning("  ❌ PrivateKey 为空")
+		} else {
+			uiInfo("  ✓ PrivateKey 已设置")
+		}
+		if acc.IPv4 == "" && acc.IPv6 == "" {
+			uiWarning("  ❌ IPv4 和 IPv6 都为空")
+		} else {
+			uiInfo(fmt.Sprintf("  IPv4: %s  IPv6: %s", acc.IPv4, acc.IPv6))
+		}
+	}
+
+	// 5. 检查接口状态
+	uiStep(5, 7, "检查 WireGuard 接口")
+	if out, err := exec.Command("wg", "show", warpIfName).CombinedOutput(); err != nil {
+		uiWarning("  warp 接口不存在或未启动")
+	} else {
+		uiInfo("  ✓ warp 接口存在")
+		output := string(out)
+		if strings.Contains(output, "latest handshake") {
+			uiInfo("  ✓ 已有握手记录")
+		} else {
+			uiWarning("  ⚠ 无握手记录 — Endpoint 可能不可达")
+		}
+		// 显示简要状态
+		for _, line := range strings.Split(output, "\n") {
+			line = strings.TrimSpace(line)
+			if line != "" {
+				uiInfo(fmt.Sprintf("  %s", line))
+			}
+		}
+	}
+
+	// 6. 测试 UDP 连通性
+	uiStep(6, 7, "测试 UDP 连通性")
+	endpoints := []string{"162.159.192.1:2408", "162.159.193.1:2408", "162.159.204.1:2408"}
+	// 从配置文件读取实际 endpoint
+	if data, err := os.ReadFile(warpConfPath); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.HasPrefix(strings.TrimSpace(line), "Endpoint") {
+				parts := strings.SplitN(line, "=", 2)
+				if len(parts) == 2 {
+					ep := strings.TrimSpace(parts[1])
+					if ep != "" {
+						endpoints = append([]string{ep}, endpoints...)
+					}
+				}
+			}
+		}
+	}
+	seen := map[string]bool{}
+	for _, ep := range endpoints {
+		if seen[ep] {
+			continue
+		}
+		seen[ep] = true
+		conn, err := net.DialTimeout("udp", ep, 5*time.Second)
+		if err != nil {
+			uiWarning(fmt.Sprintf("  ❌ %s — %v", ep, err))
+			continue
+		}
+		conn.SetDeadline(time.Now().Add(3 * time.Second))
+		_, err = conn.Write([]byte{0x01})
+		if err != nil {
+			uiWarning(fmt.Sprintf("  ❌ %s — 发送失败: %v", ep, err))
+			conn.Close()
+			continue
+		}
+		buf := make([]byte, 64)
+		_, err = conn.Read(buf)
+		conn.Close()
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			uiInfo(fmt.Sprintf("  ✓ %s — 可达", ep))
+		} else if err != nil {
+			uiHint(fmt.Sprintf("  ⚠ %s — %v", ep, err))
+		} else {
+			uiInfo(fmt.Sprintf("  ✓ %s — 收到回复", ep))
+		}
+	}
+
+	// 7. 测试 Cloudflare trace
+	uiStep(7, 7, "测试 Cloudflare 连通性")
+	uiInfo("  检测 warp 状态...")
+	warpOn, gwOn := getTraceStatus()
+	if warpOn {
+		uiInfo("  ✓ warp=on — WARP 已激活")
+	} else {
+		uiWarning("  ❌ warp≠on — WARP 未激活")
+	}
+	uiInfo(fmt.Sprintf("  gateway=%v", gwOn))
+
+	ip := getIP("https://api4.ipify.org")
+	if ip != "" {
+		uiInfo(fmt.Sprintf("  当前出口 IPv4: %s", ip))
+	} else {
+		uiWarning("  无法获取出口 IPv4（网络可能不通）")
+	}
+
+	uiSeparator()
+	uiHint("诊断完成。如果 UDP 不可达，建议用菜单 e 切换优选 IP")
+	uiHint("如需帮助，请把以上输出完整贴出")
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 func waitForDpkgLock(pkgManager string) error {
 	if pkgManager != "apt" {
 		return nil
@@ -1898,6 +2209,7 @@ func execute() {
 	flag.BoolVar(&optUninstall, "u", false, "卸载所有 WARP 组件")
 	flag.BoolVar(&optVersion, "v", false, "显示版本")
 	flag.BoolVar(&optVersion, "version", false, "显示版本")
+	optDiag := flag.Bool("diag", false, "诊断 WARP 连接问题")
 	flag.Parse()
 
 	if optVersion {
@@ -1911,6 +2223,11 @@ func execute() {
 	}
 	if err := checkRoot(); err != nil {
 		uiError(err.Error())
+	}
+
+	if *optDiag {
+		runDiagnostics()
+		return
 	}
 
 	opts := &InstallOptions{}
