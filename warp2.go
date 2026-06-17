@@ -25,7 +25,7 @@ import (
 // ════════════════════════════════════════════════════════════════════════════════
 
 const (
-	appVersion = "2.0.2"
+	appVersion = "2.0.3"
 
 	// Cloudflare WARP API
 	warpRegisterURL    = "https://warp.cloudflare.nyc.mn/?run=register"
@@ -878,48 +878,46 @@ func generateWgConfig(opts WgConfigOptions) error {
 	return os.WriteFile(warpConfPath, []byte(conf), 0600)
 }
 
-// globalPreUpScript 在 wg-quick 修改路由之前执行，捕获 VPS 原始出口 IP。
-// PreUp 时机：接口未建立，路由规则未变，ip route get 返回的 src 是真实 VPS IP。
+// globalPreUpScript 在 wg-quick 修改路由之前执行 SSH 保护。
+//
+// 核心策略：在接口创建前，添加高优先级 ip rule，让 VPS 自身 IP 的出站流量走 main 表。
+// PreUp 时机：接口未建立，路由规则未变，是添加保护规则的最佳时机。
+//
+// 为什么不在 PostUp 中做：wg-quick 创建接口时立即接管路由，PostUp 来不及保护 SSH。
+// 为什么用 ip rule 而不是 nft mark：nft 的 OUTPUT chain 在路由决策之后执行，无法影响路由。
 func globalPreUpScript(stack stackMode) string {
 	var cmds []string
 	cmds = append(cmds, "mkdir -p /run/warp-ssh")
 	if stack == stackIPv4 || stack == stackDual {
 		cmds = append(cmds,
+			// 保存原始 IP（用于 PostDown 清理）
 			`ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}' > /run/warp-ssh/orig_ip4 || true`,
+			// 添加 SSH 保护规则：VPS 自身 IP 的出站流量走 main 表（优先级 0，最高）
+			`([ -s /run/warp-ssh/orig_ip4 ] && ip -4 rule add from "$(cat /run/warp-ssh/orig_ip4)" table main priority 0 || true) 2>/dev/null`,
 		)
 	}
 	if stack == stackIPv6 || stack == stackDual {
 		cmds = append(cmds,
 			`ip -6 route get 2606:4700::1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}' > /run/warp-ssh/orig_ip6 || true`,
+			`([ -s /run/warp-ssh/orig_ip6 ] && ip -6 rule add from "$(cat /run/warp-ssh/orig_ip6)" table main priority 0 || true) 2>/dev/null`,
 		)
 	}
 	return strings.Join(cmds, "; ")
 }
 
-// globalPostUpScript 在 wg-quick 路由设置完成后执行：
-// 1) 读取 PreUp 保存的原始 IP，添加高优先级（10）ip rule，让原始 IP 的出站流量走 main 表。
-// 2) 在 wg-quick 创建的 nft 表中插入 SSH 豁免规则，防止 nft 给 SSH 回包打 fwmark。
-//    wg-quick 的 nft 会给所有本机发出的包打 fwmark 0xca6c，导致包匹配 suppress_prefixlength 0
-//    规则时默认路由被抑制、无可用路由而丢包。豁免规则让已建立的 SSH 连接不被标记。
+// globalPostUpScript 在 wg-quick 路由设置完成后执行（SSH 保护已在 PreUp 中完成）。
+// PostUp 仅用于非关键的后续操作，不依赖它来保护 SSH。
 func globalPostUpScript() string {
-	sshNft := `nft list table ip wg-quick-warp >/dev/null 2>&1 && { ` +
-		`SP=$(grep -i "^Port " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2; exit}'); ` +
-		`SP=${SP:-22}; ` +
-		`nft insert rule ip wg-quick-warp output ct state established,related tcp sport "$SP" accept 2>/dev/null || true; } || true`
-	// 注意：用 ; 分隔且每条命令都以 || true 结尾，因为 wg-quick 以 set -e 运行 PostUp，
+	// 用 ; 分隔且每条命令都以 || true 结尾，因为 wg-quick 以 set -e 运行 PostUp，
 	// 任何命令返回非零（如 [ -s file ] 文件不存在、IPv6 不可用）都会导致接口被 tear down。
-	return strings.Join([]string{
-		`([ -s /run/warp-ssh/orig_ip4 ] && ip -4 rule add from "$(cat /run/warp-ssh/orig_ip4)" table main priority 10 || true) 2>/dev/null`,
-		`([ -s /run/warp-ssh/orig_ip6 ] && ip -6 rule add from "$(cat /run/warp-ssh/orig_ip6)" table main priority 10 || true) 2>/dev/null`,
-		sshNft,
-	}, "; ")
+	return "true"
 }
 
-// globalPostDownScript 撤销 PostUp 添加的规则，清理临时文件。
+// globalPostDownScript 撤销 PreUp 添加的 SSH 保护规则，清理临时文件。
 func globalPostDownScript() string {
 	return strings.Join([]string{
-		`([ -s /run/warp-ssh/orig_ip4 ] && ip -4 rule del from "$(cat /run/warp-ssh/orig_ip4)" table main priority 10 || true) 2>/dev/null`,
-		`([ -s /run/warp-ssh/orig_ip6 ] && ip -6 rule del from "$(cat /run/warp-ssh/orig_ip6)" table main priority 10 || true) 2>/dev/null`,
+		`([ -s /run/warp-ssh/orig_ip4 ] && ip -4 rule del from "$(cat /run/warp-ssh/orig_ip4)" table main priority 0 || true) 2>/dev/null`,
+		`([ -s /run/warp-ssh/orig_ip6 ] && ip -6 rule del from "$(cat /run/warp-ssh/orig_ip6)" table main priority 0 || true) 2>/dev/null`,
 		`rm -f /run/warp-ssh/orig_ip4 /run/warp-ssh/orig_ip6`,
 	}, "; ")
 }
@@ -1466,6 +1464,10 @@ func installWireGuardMode(sysInfo *SysInfo, opts *InstallOptions) error {
 	if err != nil {
 		return fmt.Errorf("注册 WARP 失败: %v", err)
 	}
+	// 保存账号信息到文件（registerWARPPlainOfficial 不会自动保存）
+	if err := account.saveToFile(warpAccountPath); err != nil {
+		return fmt.Errorf("保存账号信息失败: %v", err)
+	}
 	uiInfo(fmt.Sprintf("注册成功 (ID: %s)", account.ID[:8]))
 	var stack stackMode
 	switch opts.Mode {
@@ -1975,18 +1977,24 @@ func cleanupNetworkRules() {
 		exec.Command("ip", "-6", "rule", "del", "not", "fwmark", "51820", "table", "51820").Run()
 		exec.Command("ip", "-6", "rule", "del", "table", "51820").Run()
 	}
-	// 清理 PostUp 添加的 "from <VPS-IP> table main priority 10" 规则
+	// 清理 PreUp 添加的 "from <VPS-IP> table main priority 0" 规则（SSH 保护）
 	for _, proto := range []string{"-4", "-6"} {
-		out, _ := exec.Command("ip", proto, "rule", "show", "priority", "10").Output()
+		out, _ := exec.Command("ip", proto, "rule", "show", "priority", "0").Output()
 		for _, line := range strings.Split(string(out), "\n") {
-			if idx := strings.Index(line, "from "); idx >= 0 {
-				rest := strings.Fields(line[idx:])
-				if len(rest) >= 2 {
-					exec.Command("ip", proto, "rule", "del", "from", rest[1], "table", "main", "priority", "10").Run()
+			if strings.Contains(line, "from ") && strings.Contains(line, "lookup main") {
+				rest := strings.Fields(line)
+				for i, v := range rest {
+					if v == "from" && i+1 < len(rest) {
+						exec.Command("ip", proto, "rule", "del", "from", rest[i+1], "table", "main", "priority", "0").Run()
+						break
+					}
 				}
 			}
 		}
 	}
+	// 清理 suppress_prefixlength 0 规则
+	exec.Command("ip", "rule", "del", "table", "main", "suppress_prefixlength", "0").Run()
+	exec.Command("ip", "-6", "rule", "del", "table", "main", "suppress_prefixlength", "0").Run()
 	exec.Command("ip", "route", "flush", "table", "51820").Run()
 	exec.Command("ip", "-6", "route", "flush", "table", "51820").Run()
 	exec.Command("iptables", "-t", "nat", "-F", "WARP_PROXY").Run()
@@ -1997,10 +2005,23 @@ func cleanupNetworkRules() {
 	exec.Command("ip6tables", "-t", "nat", "-X", "WARP_PROXY").Run()
 	exec.Command("nft", "delete", "table", "ip", "warp_proxy").Run()
 	exec.Command("nft", "delete", "table", "ip6", "warp_proxy").Run()
+	// 清理 SSH 保护临时目录
+	os.RemoveAll("/run/warp-ssh")
 }
 
 func cleanupConfigFiles() {
-	for _, f := range []string{warpConfPath, warpAccountPath, warpConfPath + ".bak", warpAccountPath + ".bak", zeroTrustConfigPath, "/var/lib/cloudflare-warp/mdm.xml", "/var/lib/cloudflare-warp/reg.json", "/var/lib/cloudflare-warp/config.json", "/etc/systemd/system/warpgo-reverse-proxy.service"} {
+	for _, f := range []string{
+		warpConfPath,
+		warpAccountPath,
+		warpConfPath + ".bak",
+		warpAccountPath + ".bak",
+		zeroTrustConfigPath,
+		"/var/lib/cloudflare-warp/mdm.xml",
+		"/var/lib/cloudflare-warp/reg.json",
+		"/var/lib/cloudflare-warp/config.json",
+		"/etc/systemd/system/warpgo-reverse-proxy.service",
+		"/etc/systemd/system/warpgo-autoconnect.service",
+	} {
 		os.Remove(f)
 	}
 }
