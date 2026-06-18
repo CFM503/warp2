@@ -25,7 +25,7 @@ import (
 // ════════════════════════════════════════════════════════════════════════════════
 
 const (
-	appVersion = "2.0.3"
+	appVersion = "2.0.4"
 
 	// Cloudflare WARP API
 	warpRegisterURL    = "https://warp.cloudflare.nyc.mn/?run=register"
@@ -71,13 +71,6 @@ const (
 	stackIPv4 stackMode = iota
 	stackIPv6
 	stackDual
-)
-
-// Zero Trust 接入模式
-type ztEnrollMode int
-
-const (
-	enrollModeServiceToken ztEnrollMode = iota // 非交互：Service Token
 )
 
 // SysInfo 系统信息
@@ -184,7 +177,6 @@ type InstallOptions struct {
 	Endpoint string
 
 	ZeroTrustOrg          string
-	ZeroTrustEnrollMode   ztEnrollMode
 	ZeroTrustClientID     string
 	ZeroTrustClientSecret string
 }
@@ -339,10 +331,12 @@ func showMenu(title string, items []MenuItem) string {
 	return readInput("请输入选项: ")
 }
 
+// 全局 stdin reader（避免每次 readInput 创建新 bufio.Reader 导致缓冲区丢失）
+var stdinReader = bufio.NewReader(os.Stdin)
+
 func readInput(prompt string) string {
 	fmt.Printf("  %s%s%s ", colorCyan, prompt, colorReset)
-	reader := bufio.NewReader(os.Stdin)
-	input, _ := reader.ReadString('\n')
+	input, _ := stdinReader.ReadString('\n')
 	return strings.TrimSpace(input)
 }
 
@@ -563,41 +557,35 @@ func registerWARPPlainProxy() (*Account, error) {
 }
 
 // registerWARPZeroTrust 直接调用 Cloudflare 官方 API 注册并关联 Zero Trust 组织。
-// 流程：本地生成 Curve25519 密钥对 → POST /reg 携带 CF-Access headers → 解析 peer/地址信息。
-// 这是让 gateway=on 的唯一正确路径。
+// 流程：本地生成 Curve25519 密钥对 → POST /reg 携带 CF-Access headers → 解析 peer/地址信息。// registerWARPZeroTrust 通过第三方代理注册 WARP 并关联 Zero Trust 组织。
+// 代理 URL 接受 ZT 凭据（organization/auth_client_id/auth_client_secret）在 body 中，
+// 返回完整的 WireGuard 账号（含 private_key），可直接用于 wg-quick。
 func registerWARPZeroTrust(team *teamRegistration) (*Account, error) {
-	// Step 1: 本地生成 Curve25519 密钥对
-	privKey, err := ecdh.X25519().GenerateKey(rand.Reader)
-	if err != nil {
-		return nil, fmt.Errorf("生成密钥对失败: %v", err)
-	}
-	pubKeyB64 := base64.StdEncoding.EncodeToString(privKey.PublicKey().Bytes())
-	privKeyB64 := base64.StdEncoding.EncodeToString(privKey.Bytes())
+	payload := fmt.Sprintf(`{
+  "key": "",
+  "install_id": "",
+  "fcm_token": "",
+  "tos": "%s",
+  "model": "Linux",
+  "serial_number": "",
+  "os_version": "12",
+  "os_type": "Android",
+  "app_name": "1.1.1.1",
+  "app_version": "6.10",
+  "partner_id": "warp-go",
+  "organization": "%s",
+  "auth_client_id": "%s",
+  "auth_client_secret": "%s"
+}`, time.Now().UTC().Format(time.RFC3339), team.orgName, team.clientID, team.clientSecret)
 
-	// Step 2: 构造注册 body
-	installID := newUUID()
-	body := map[string]interface{}{
-		"key":           pubKeyB64,
-		"install_id":    installID,
-		"fcm_token":     newUUID(),
-		"tos":           time.Now().UTC().Format(time.RFC3339),
-		"model":         "Linux",
-		"serial_number": installID,
-		"locale":        "zh-CN",
-	}
-	bodyJSON, err := json.Marshal(body)
-	if err != nil {
-		return nil, fmt.Errorf("序列化请求失败: %v", err)
-	}
-
-	// Step 3: 发送注册请求，带 CF-Access headers 关联 ZT 组织
 	client := &http.Client{Timeout: 30 * time.Second}
-	req, err := http.NewRequest("POST", warpCFAPIBase+"/reg", bytes.NewReader(bodyJSON))
+	req, err := http.NewRequest("POST", warpRegisterURL, strings.NewReader(payload))
 	if err != nil {
 		return nil, fmt.Errorf("构造请求失败: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "1.1.1.1/6.29 CFNetwork/1408.0.4 Darwin/22.5.0")
+	req.Header.Set("User-Agent", "okhttp/3.12.1")
+	req.Header.Set("CF-Client-Version", "a-6.10-2158")
 	req.Header.Set("CF-Access-Client-Id", team.clientID)
 	req.Header.Set("CF-Access-Client-Secret", team.clientSecret)
 
@@ -611,39 +599,20 @@ func registerWARPZeroTrust(team *teamRegistration) (*Account, error) {
 		return nil, fmt.Errorf("读取响应失败: %v", err)
 	}
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("ZT 注册失败 (HTTP %d): %s", resp.StatusCode, string(respBody))
+		return nil, fmt.Errorf("ZT 注册失败 (HTTP %d): %s", resp.StatusCode, string(respBody[:min(200, len(respBody))]))
 	}
 
-	// Step 4: 解析响应，官方 API 不返回 private_key，需用本地生成的
 	var result map[string]interface{}
 	if err := json.Unmarshal(respBody, &result); err != nil {
 		return nil, fmt.Errorf("解析响应失败: %v", err)
 	}
 
-	// 验证是否成功关联 ZT 组织（account.team 字段存在）
-	teamName := ""
-	if acc, ok := result["account"].(map[string]interface{}); ok {
-		if t, ok := acc["team"].(string); ok && t != "" {
-			teamName = t
-		}
+	account := parseWARPAccount(result, true, team.orgName)
+	if account.PrivateKey == "" {
+		return nil, fmt.Errorf("代理未返回 private_key，ZT 注册可能失败")
 	}
-	if teamName == "" {
-		// 兼容不同版本 API 字段位置
-		if t, ok := result["team_name"].(string); ok && t != "" {
-			teamName = t
-		}
-	}
-	if teamName == "" {
-		return nil, fmt.Errorf("ZT 注册成功但未关联到组织，请检查 CF-Access-Client-Id/Secret 是否正确，以及该 Service Token 是否有 WARP enrollment 权限")
-	}
-
-	account := parseWARPAccount(result, true, teamName)
-	// 官方 API 不返回 private_key，填入本地生成的
-	account.PrivateKey = privKeyB64
-	account.PublicKey = pubKeyB64
-
-	if err := validateAccount(account); err != nil {
-		return nil, fmt.Errorf("ZT 注册数据无效: %v", err)
+	if account.IPv4 == "" && account.IPv6 == "" {
+		return nil, fmt.Errorf("代理未返回 IP 地址")
 	}
 
 	if err := account.saveToFile(warpAccountPath); err != nil {
@@ -711,6 +680,7 @@ func (a *Account) saveToFile(path string) error {
 	if err != nil {
 		return err
 	}
+	os.MkdirAll("/etc/wireguard", 0700)
 	return os.WriteFile(path, data, 0600)
 }
 
@@ -1088,11 +1058,21 @@ func enrollServiceToken(orgName, clientID, clientSecret string) error {
 		return fmt.Errorf("写入 MDM 配置失败: %v", err)
 	}
 
-	ztConfig := &ZeroTrustConfig{
-		OrgName: orgName, ClientID: clientID, ClientSecret: clientSecret,
-		UseProxyMode: true, Socks5Port: defaultSocks5Port,
+	// 更新 ZT 配置（保留已有的 ExternalPort 等字段）
+	if existingCfg, err := loadZTConfig(); err == nil {
+		existingCfg.OrgName = orgName
+		existingCfg.ClientID = clientID
+		existingCfg.ClientSecret = clientSecret
+		existingCfg.UseProxyMode = true
+		existingCfg.Socks5Port = defaultSocks5Port
+		saveZTConfig(existingCfg)
+	} else {
+		ztConfig := &ZeroTrustConfig{
+			OrgName: orgName, ClientID: clientID, ClientSecret: clientSecret,
+			UseProxyMode: true, Socks5Port: defaultSocks5Port,
+		}
+		saveZTConfig(ztConfig)
 	}
-	saveZTConfig(ztConfig)
 
 	// 重启前先断开连接，防止 warp-svc 重启后自动重连（全隧道模式）导致 SSH 中断
 	exec.Command("warp-cli", "--accept-tos", "disconnect").Run()
@@ -1230,6 +1210,11 @@ func toggleTransparentProxy() {
 
 func setupTransparentProxy(socks5Port int) {
 	exec.Command("apt-get", "install", "-y", "redsocks").Run()
+	// 确保 iptables 已安装（透明代理依赖）
+	if _, err := exec.LookPath("iptables"); err != nil {
+		uiInfo("安装 iptables...")
+		exec.Command("apt-get", "install", "-y", "iptables").Run()
+	}
 	redsocksConf := fmt.Sprintf("base {\n\tlog_debug = off;\n\tlog_info = on;\n\tdaemon = on;\n\tredirector = iptables;\n}\n\nredsocks {\n\tlocal_ip = 127.0.0.1;\n\tlocal_port = %d;\n\tip = 127.0.0.1;\n\tport = %d;\n\ttype = socks5;\n}\n", defaultRedsocksPort, socks5Port)
 	os.WriteFile("/etc/redsocks.conf", []byte(redsocksConf), 0644)
 	exec.Command("systemctl", "stop", "redsocks").Run()
@@ -1327,7 +1312,11 @@ func removeProxyService() {
 // warp-cli proxy 模式在 127.0.0.1:40000 监听，socat 做 TCP 转发让外部设备可连接。
 func setupExternalProxy(externalPort int) {
 	if externalPort <= 0 || externalPort > 65535 {
-		externalPort = defaultSocks5Port
+		externalPort = defaultSocks5Port + 1
+	}
+	// 避免与 warp-svc 的 SOCKS5 端口冲突
+	if externalPort == defaultSocks5Port {
+		externalPort = defaultSocks5Port + 1
 	}
 	// 确保 socat 已安装
 	if _, err := exec.LookPath("socat"); err != nil {
@@ -1501,12 +1490,11 @@ func installWireGuardMode(sysInfo *SysInfo, opts *InstallOptions) error {
 // warp-cli 把 exclude 列表持久化到 local_settings.json，
 // 重启后 warp-svc 读取该文件，connect 时自动应用，无需重复设置。
 // warpgo-autoconnect.service 也会在每次开机时重新添加，防止 IP 变化后失效。
-func protectSSHForZT() {
+func protectSSHForZT() error {
 	// 获取 VPS 当前出口 IPv4（在 connect 前执行，路由未被接管）
 	out, err := exec.Command("ip", "-4", "route", "get", "1.1.1.1").Output()
 	if err != nil {
-		uiHint("  无法获取出口 IP，跳过 SSH exclude 设置")
-		return
+		return fmt.Errorf("无法获取出口 IP")
 	}
 	vpsIP := ""
 	fields := strings.Fields(string(out))
@@ -1517,26 +1505,25 @@ func protectSSHForZT() {
 		}
 	}
 	if vpsIP == "" {
-		uiHint("  无法解析出口 IP，跳过 SSH exclude 设置")
-		return
+		return fmt.Errorf("无法解析出口 IP")
 	}
 
 	// 确认 split tunnel 为 exclude mode（默认，不走 WARP 的白名单）
 	exec.Command("warp-cli", "--accept-tos", "tunnel", "ip", "set-mode", "default").Run()
 
 	// 将 VPS 自身 IP exclude：SSH 回包从原始网关出，不走 WARP
-	cidr := vpsIP + "/32"
-	if err := exec.Command("warp-cli", "--accept-tos", "tunnel", "ip", "add", cidr).Run(); err != nil {
-		uiHint(fmt.Sprintf("  添加 SSH exclude 失败（%s）: %v", cidr, err))
-	} else {
-		uiInfo(fmt.Sprintf("✓ SSH 保护：%s 已加入 WARP exclude 列表（持久化）", cidr))
+	out, err = exec.Command("warp-cli", "--accept-tos", "tunnel", "ip", "add", vpsIP).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("添加 SSH exclude 失败（%s）: %v %s", vpsIP, err, strings.TrimSpace(string(out)))
 	}
+	uiInfo(fmt.Sprintf("✓ SSH 保护：%s 已加入 WARP exclude 列表（持久化）", vpsIP))
 
 	// 同时 exclude 私有地址，防止内网访问被 WARP 接管
 	for _, private := range []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"} {
 		exec.Command("warp-cli", "--accept-tos", "tunnel", "ip", "add", private).Run()
 	}
 	uiHint("  私有地址段（10/8、172.16/12、192.168/16）已加入 exclude")
+	return nil
 }
 
 // setupWarpAutoConnect 创建开机自动连接的 systemd 服务。
@@ -1601,7 +1588,10 @@ func installZeroTrustMode(sysInfo *SysInfo, opts *InstallOptions) error {
 	}
 	uiStep(3, 7, "配置 SSH 保护")
 	// 先设置 SSH exclude 规则（持久化），确保后续 connect 不会中断 SSH
-	protectSSHForZT()
+	if err := protectSSHForZT(); err != nil {
+		uiWarning(fmt.Sprintf("SSH 保护设置失败: %v", err))
+		uiHint("  警告: 连接后 SSH 可能中断，继续...")
+	}
 	uiStep(4, 7, "注册 Zero Trust (Proxy 模式)")
 	if err := enrollServiceToken(opts.ZeroTrustOrg, opts.ZeroTrustClientID, opts.ZeroTrustClientSecret); err != nil {
 		return fmt.Errorf("注册失败: %v", err)
@@ -1615,7 +1605,7 @@ func installZeroTrustMode(sysInfo *SysInfo, opts *InstallOptions) error {
 		return fmt.Errorf("连接失败: %v", err)
 	}
 	uiStep(7, 7, "配置反代 & 验证")
-	extPort := defaultSocks5Port
+	extPort := defaultSocks5Port + 1
 	if cfg, err := loadZTConfig(); err == nil && cfg.ExternalPort > 0 {
 		extPort = cfg.ExternalPort
 	}
@@ -1639,36 +1629,34 @@ func installZeroTrustMode(sysInfo *SysInfo, opts *InstallOptions) error {
 func installZeroTrustWGMode(sysInfo *SysInfo, opts *InstallOptions) error {
 	uiHeader("开始配置 Zero Trust (WireGuard)")
 	uiSeparator()
-	uiStep(1, 7, "安装系统依赖")
+	uiStep(1, 6, "安装系统依赖")
 	if err := installDependencies(sysInfo); err != nil {
 		return fmt.Errorf("安装依赖失败: %v", err)
 	}
-	uiStep(2, 7, "安装 WireGuard")
+	uiStep(2, 6, "安装 WireGuard")
 	if err := installWireguardTools(sysInfo); err != nil {
 		return fmt.Errorf("安装 WireGuard 失败: %v", err)
 	}
-	uiStep(3, 7, "注册 Cloudflare WARP 并关联 Zero Trust Team")
+	uiStep(3, 6, "注册 Cloudflare WARP 并关联 Zero Trust Team")
 	account, err := registerWARP(&teamRegistration{orgName: opts.ZeroTrustOrg, clientID: opts.ZeroTrustClientID, clientSecret: opts.ZeroTrustClientSecret})
 	if err != nil {
 		return fmt.Errorf("注册 WARP 失败: %v", err)
 	}
 	uiInfo(fmt.Sprintf("注册成功 (ID: %s, Team: %s)", account.ID[:8], opts.ZeroTrustOrg))
-	uiStep(4, 7, "生成 WireGuard 配置")
+	uiStep(4, 6, "生成 WireGuard 配置")
 	if err := generateWgConfig(WgConfigOptions{Account: account, Stack: stackDual, Endpoint: opts.Endpoint}); err != nil {
 		return fmt.Errorf("生成配置失败: %v", err)
 	}
-	uiStep(5, 7, "启动 WARP 接口")
+	uiStep(5, 6, "启动 WARP 接口")
 	if err := wgStart(); err != nil {
 		return fmt.Errorf("启动失败: %v", err)
 	}
-	// 开机自启
 	exec.Command("systemctl", "daemon-reload").Run()
 	exec.Command("systemctl", "enable", "wg-quick@warp").Run()
-	uiStep(6, 7, "验证连接")
+	uiStep(6, 6, "验证连接")
 	if !verifyConnectionWithFallback(opts.Endpoint) {
 		return fmt.Errorf("WARP 连接失败，请运行 ./warpgo -diag 查看详情")
 	}
-	uiStep(7, 7, "完成")
 	uiInfo("✓ Zero Trust (WireGuard) 配置完成")
 	return nil
 }
@@ -1699,8 +1687,8 @@ func verifyConnectionWithFallback(userEndpoint string) bool {
 	}
 
 	fallbackPorts := []string{"500", "1701", "4500", "8443"}
-	// 如果默认 IP 的所有端口都失败，换一个 IP 段
-	fallbackIPs := []string{"162.159.192.1", "162.159.204.1"}
+	// IPv4 和 IPv6 Endpoint：部分 VPS 机房 IPv4 出站被封但 IPv6 通畅
+	fallbackIPs := []string{"162.159.192.1", "162.159.204.1", "2606:4700:d0::a"}
 
 	tried := map[string]bool{currentEP: true}
 
@@ -1755,53 +1743,7 @@ func printDiagnostics() {
 	uiHint("    1. 运行 ./warpgo -diag 查看详细诊断")
 	uiHint("    2. VPS 可能封了所有 UDP 出站（常见于国内机房）")
 	uiHint("    3. 尝试菜单 e 手动指定优选 IP:端口")
-}
-
-func verifyConnection() {
-	uiInfo("等待 WARP 握手建立...")
-	var status *NetworkStatus
-	for i := 0; i < 4; i++ {
-		time.Sleep(5 * time.Second)
-		status = getNetworkStatus()
-		if status.WarpEnabled {
-			break
-		}
-		if i < 3 {
-			uiInfo(fmt.Sprintf("  等待中... (%d/4)", i+1))
-		}
-	}
-	if status.WarpEnabled {
-		uiInfo(fmt.Sprintf("✓ WARP 已激活 — IPv4: %s", status.IPv4))
-		if status.IPv6 != "" {
-			uiInfo(fmt.Sprintf("  IPv6: %s", status.IPv6))
-		}
-		// 检查是否成功接入 Zero Trust Gateway
-		if status.GatewayEnabled {
-			uiInfo("✓ Zero Trust Gateway 已接入 (gateway=on)")
-		} else {
-			uiHint("  提示: gateway=off，当前为普通 WARP 模式（非 Zero Trust）")
-		}
-	} else {
-		uiWarning("WARP 连接验证超时")
-		// 诊断握手状态
-		if out, err := exec.Command("wg", "show", warpIfName, "latest-handshakes").Output(); err == nil {
-			hs := strings.TrimSpace(string(out))
-			if hs == "" || strings.HasSuffix(hs, "0") {
-				uiWarning("  原因: WireGuard 握手未完成（Endpoint 无法到达或密钥无效）")
-				uiHint("  可能原因:")
-				uiHint("    1. VPS 出口 UDP 被封（部分机房封 UDP 2408）")
-				uiHint("    2. 第三方注册服务返回了无效的密钥/IP")
-				uiHint("    3. Endpoint IP 不可达")
-				uiHint("  建议: 菜单选 e 切换优选 IP，或检查 UDP 连通性")
-			} else {
-				uiHint("  WireGuard 握手已完成，但 Cloudflare trace 验证失败")
-				uiHint("  可能是 DNS 解析问题，请检查 /etc/resolv.conf")
-			}
-		}
-		uiHint(fmt.Sprintf("  当前 IPv4: %s", status.IPv4))
-		uiHint("  手动验证: curl https://www.cloudflare.com/cdn-cgi/trace | grep -E 'warp|gateway'")
-		uiHint("  查看握手: wg show warp")
-	}
+	uiHint("    4. 如果 IPv4 握手失败，尝试 IPv6 Endpoint: [2606:4700:d0::a]:2408")
 }
 
 // verifyProxyConnection 验证 proxy 模式连接：通过 SOCKS5 代理访问 Cloudflare trace 确认 warp=on
@@ -2191,9 +2133,9 @@ func runDiagnostics() {
 		}
 	}
 
-	// 6. 测试 UDP 连通性
+	// 6. 测试 UDP 连通性（包含 IPv6 Endpoint，部分 VPS IPv4 不通但 IPv6 可用）
 	uiStep(6, 7, "测试 UDP 连通性")
-	endpoints := []string{"162.159.192.1:2408", "162.159.193.1:2408", "162.159.204.1:2408"}
+	endpoints := []string{"162.159.192.1:2408", "162.159.193.1:2408", "162.159.204.1:2408", "[2606:4700:d0::a]:2408"}
 	// 从配置文件读取实际 endpoint
 	if data, err := os.ReadFile(warpConfPath); err == nil {
 		for _, line := range strings.Split(string(data), "\n") {
@@ -2230,7 +2172,7 @@ func runDiagnostics() {
 		_, err = conn.Read(buf)
 		conn.Close()
 		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			uiInfo(fmt.Sprintf("  ✓ %s — 可达", ep))
+			uiHint(fmt.Sprintf("  ⚠ %s — 无响应（可能被过滤，但 WireGuard 仍可尝试）", ep))
 		} else if err != nil {
 			uiHint(fmt.Sprintf("  ⚠ %s — %v", ep, err))
 		} else {
@@ -2257,16 +2199,11 @@ func runDiagnostics() {
 	}
 
 	uiSeparator()
-	uiHint("诊断完成。如果 UDP 不可达，建议用菜单 e 切换优选 IP")
+	uiHint("诊断完成。如果 IPv4 Endpoint 握手失败，建议尝试 IPv6 Endpoint: [2606:4700:d0::a]:2408")
+	uiHint("菜单选 e 切换优选 IP，或检查 VPS UDP 出站策略")
 	uiHint("如需帮助，请把以上输出完整贴出")
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
 
 func waitForDpkgLock(pkgManager string) error {
 	if pkgManager != "apt" {
@@ -2411,14 +2348,21 @@ func showMainMenu(sysInfo *SysInfo) {
 		isConnected := false
 
 		if ztInstalled && ztStatus.Connected {
-			connectionType = "Zero Trust Proxy"
 			isConnected = true
-			if ztCfg, err := loadZTConfig(); err == nil {
+			if ztCfg, err := loadZTConfig(); err == nil && !ztCfg.UseProxyMode {
+				connectionType = "Zero Trust (WireGuard)"
 				if ztCfg.OrgName != "" {
 					connectionInfo = fmt.Sprintf("组织: %s", ztCfg.OrgName)
 				}
-				if ztCfg.ExternalPort > 0 {
-					connectionInfo += fmt.Sprintf(" | 端口: %d", ztCfg.ExternalPort)
+			} else {
+				connectionType = "Zero Trust Proxy"
+				if ztCfg, err := loadZTConfig(); err == nil {
+					if ztCfg.OrgName != "" {
+						connectionInfo = fmt.Sprintf("组织: %s", ztCfg.OrgName)
+					}
+					if ztCfg.ExternalPort > 0 {
+						connectionInfo += fmt.Sprintf(" | 端口: %d", ztCfg.ExternalPort)
+					}
 				}
 			}
 		} else if wgInstalled && wgRunning {
@@ -2439,7 +2383,11 @@ func showMainMenu(sysInfo *SysInfo) {
 				connectionType = "WARP WireGuard (已停止)"
 			}
 		} else if ztInstalled {
-			connectionType = "Zero Trust Proxy (已断开)"
+			if ztCfg, err := loadZTConfig(); err == nil && !ztCfg.UseProxyMode {
+				connectionType = "Zero Trust (WireGuard) (已断开)"
+			} else {
+				connectionType = "Zero Trust Proxy (已断开)"
+			}
 		} else {
 			connectionType = "未安装"
 		}
@@ -2449,22 +2397,31 @@ func showMainMenu(sysInfo *SysInfo) {
 		// 显示详细状态
 		if isConnected {
 			if ztInstalled && ztStatus.Connected {
-				printStatusLine("Zero Trust Proxy", "已连接", true)
-				if ztStatus.Mode != "" {
-					printInfoLine("运行模式", ztStatus.Mode)
-				}
-				if ztCfg, err := loadZTConfig(); err == nil {
-					extPort := ztCfg.ExternalPort
-					if extPort <= 0 {
-						extPort = defaultSocks5Port
+				if ztCfg, err := loadZTConfig(); err == nil && !ztCfg.UseProxyMode {
+					// WireGuard 模式
+					printStatusLine("Zero Trust (WireGuard)", "已连接", true)
+					if ztStatus.Mode != "" {
+						printInfoLine("运行模式", ztStatus.Mode)
 					}
-					printInfoLine("代理地址", fmt.Sprintf("socks5://127.0.0.1:%d (本地)", defaultSocks5Port))
-					printInfoLine("外部地址", fmt.Sprintf("socks5://<VPS_IP>:%d", extPort))
-				}
-				if isTransparentProxyRunning() {
-					printStatusLine("透明代理", "已开启 (VPS 流量走 WARP)", true)
 				} else {
-					printInfoLine("透明代理", "未开启 (VPS 流量直连，菜单选 t 开启)")
+					// Proxy 模式
+					printStatusLine("Zero Trust Proxy", "已连接", true)
+					if ztStatus.Mode != "" {
+						printInfoLine("运行模式", ztStatus.Mode)
+					}
+					if ztCfg, err := loadZTConfig(); err == nil {
+						extPort := ztCfg.ExternalPort
+						if extPort <= 0 {
+							extPort = defaultSocks5Port + 1
+						}
+						printInfoLine("代理地址", fmt.Sprintf("socks5://127.0.0.1:%d (本地)", defaultSocks5Port))
+						printInfoLine("外部地址", fmt.Sprintf("socks5://<VPS_IP>:%d", extPort))
+					}
+					if isTransparentProxyRunning() {
+						printStatusLine("透明代理", "已开启 (VPS 流量走 WARP)", true)
+					} else {
+						printInfoLine("透明代理", "未开启 (VPS 流量直连，菜单选 t 开启)")
+					}
 				}
 			} else if wgInstalled && wgRunning {
 				cfgStatus := getWgConfigStatus()
@@ -2496,7 +2453,7 @@ func showMainMenu(sysInfo *SysInfo) {
 			items = append(items,
 				MenuItem{Key: "1", Label: "安装 WARP", Description: "使用 WireGuard 内核运行，全局接管所有网络流量"},
 				MenuItem{Key: "2", Label: "配置 Zero Trust Proxy", Description: "proxy 模式接入，SOCKS5 代理 + socat 反代"},
-				MenuItem{Key: "3", Label: "配置 Zero Trust (WireGuard)", Description: "使用 WireGuard 接入 Cloudflare Teams 组织网络"},
+				MenuItem{Key: "3", Label: "配置 Zero Trust (WireGuard)", Description: "通过 warp-cli 接入 Cloudflare Teams 组织（SOCKS5 代理模式）"},
 			)
 		} else if wgInstalled {
 			items = append(items,
@@ -2664,8 +2621,8 @@ func installZeroTrustMenu(sysInfo *SysInfo) {
 			uiWarning("Client Secret 不能为空")
 			return
 		}
-		extPortStr := readInput(fmt.Sprintf("请输入外部代理端口 (留空使用默认 %d): ", defaultSocks5Port))
-		extPort := defaultSocks5Port
+		extPortStr := readInput(fmt.Sprintf("请输入外部代理端口 (留空使用默认 %d): ", defaultSocks5Port+1))
+		extPort := defaultSocks5Port + 1
 		if strings.TrimSpace(extPortStr) != "" {
 			if p, err := strconv.Atoi(strings.TrimSpace(extPortStr)); err == nil && p > 0 && p <= 65535 {
 				extPort = p
@@ -2681,7 +2638,7 @@ func installZeroTrustMenu(sysInfo *SysInfo) {
 		saveZTConfig(cfg)
 		opts := &InstallOptions{
 			Mode: modeZeroTrust, ZeroTrustOrg: org,
-			ZeroTrustEnrollMode: enrollModeServiceToken, ZeroTrustClientID: clientID, ZeroTrustClientSecret: clientSecret,
+			ZeroTrustClientID: clientID, ZeroTrustClientSecret: clientSecret,
 		}
 		if err := doInstall(sysInfo, opts); err != nil {
 			uiWarning(fmt.Sprintf("安装失败: %v", err))
@@ -2726,7 +2683,7 @@ func installZeroTrustWGMenu(sysInfo *SysInfo) {
 		endpoint := readAndValidateEndpoint()
 		opts := &InstallOptions{
 			Mode: modeZeroTrustWG, Endpoint: endpoint,
-			ZeroTrustOrg: org, ZeroTrustEnrollMode: enrollModeServiceToken,
+			ZeroTrustOrg: org,
 			ZeroTrustClientID: clientID, ZeroTrustClientSecret: clientSecret,
 		}
 		if err := doInstall(sysInfo, opts); err != nil {
